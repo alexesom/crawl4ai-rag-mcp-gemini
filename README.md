@@ -1,5 +1,7 @@
 <h1 align="left">🐳 Crawl4AI+SearXNG MCP Server</h1>
 
+# **WORK IN PROGRESS! TRYING TO FIX BUGS WITH SEARCH TOOL!**
+
 <em>Web Crawling, Search and RAG Capabilities for AI Agents and AI Coding Assistants</em>
 
 > **(FORKED FROM https://github.com/coleam00/mcp-crawl4ai-rag). Added SearXNG integration and batch scrape and processing capabilities.**
