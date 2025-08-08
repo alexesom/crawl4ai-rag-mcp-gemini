@@ -315,10 +315,11 @@ def add_documents_to_supabase(
                         print(f"Successfully inserted {successful_inserts}/{len(batch_data)} records individually")
 
 def search_documents(
-    client: Client, 
-    query: str, 
-    match_count: int = 10, 
-    filter_metadata: Optional[Dict[str, Any]] = None
+    client: Client,
+    query: str,
+    match_count: int = 10,
+    filter_metadata: Optional[Dict[str, Any]] = None,
+    source_id_filter: Optional[str] = None
 ) -> List[Dict[str, Any]]:
     """
     Search for documents in Supabase using vector similarity.
@@ -327,32 +328,102 @@ def search_documents(
         client: Supabase client
         query: Query text
         match_count: Maximum number of results to return
-        filter_metadata: Optional metadata filter
+        filter_metadata: Optional metadata filter (for filtering on metadata fields)
+        source_id_filter: Optional source_id filter (for filtering on top-level source_id field)
         
     Returns:
         List of matching documents
     """
-    # Create embedding for the query
-    query_embedding = create_embedding(query)
+    import threading
+    import time
     
-    # Execute the search using the match_crawled_pages function
+    # Use threading.Timer for timeout instead of signal (works in threads)
+    timeout_event = threading.Event()
+    
+    def set_timeout():
+        timeout_event.set()
+    
+    timer = threading.Timer(30.0, set_timeout)
+    timer.start()
+    
     try:
-        # Only include filter parameter if filter_metadata is provided and not empty
+        print(f"[DEBUG] Creating embedding for query: '{query[:50]}...'")
+        # Create embedding for the query
+        query_embedding = create_embedding(query)
+        
+        if not query_embedding or all(v == 0.0 for v in query_embedding):
+            print("[ERROR] Failed to create valid embedding")
+            return []
+        
+        if timeout_event.is_set():
+            raise TimeoutError("Embedding creation timed out")
+        
+        print("[DEBUG] Executing vector search in database...")
+        
+        # Build parameters for RPC call
         params = {
             'query_embedding': query_embedding,
-            'match_count': match_count
+            'match_count': match_count * 3 if source_id_filter else match_count  # Get more results if we need to filter
         }
         
-        # Only add the filter if it's actually provided and not empty
+        # Add source filter to RPC (supported by the stored procedure as 'source_filter')
+        if source_id_filter:
+            params['source_filter'] = source_id_filter  # Correct parameter name from SQL function
+            print(f"[DEBUG] Using source_filter parameter: '{source_id_filter}'")
+        
+        # Add metadata filter if provided (for backward compatibility)
         if filter_metadata:
-            params['filter'] = filter_metadata  # Pass the dictionary directly, not JSON-encoded
+            params['filter'] = filter_metadata
+            print(f"[DEBUG] Using metadata filter: {filter_metadata}")
+        
+        # Debug log the RPC parameters
+        print(f"[DEBUG] RPC params keys: {params.keys()}")
         
         result = client.rpc('match_crawled_pages', params).execute()
         
-        return result.data
-    except Exception as e:
-        print(f"Error searching documents: {e}")
+        if timeout_event.is_set():
+            raise TimeoutError("Vector search timed out")
+        
+        if result and result.data:
+            print(f"[DEBUG] Vector search returned {len(result.data)} results before filtering")
+            
+            # If source_id_filter is specified and we got results, filter them
+            if source_id_filter and result.data:
+                # Filter results by source_id
+                filtered_results = []
+                for item in result.data:
+                    # Check if source_id matches (handle both top-level and metadata locations)
+                    item_source_id = item.get('source_id', '')
+                    if not item_source_id and 'metadata' in item and isinstance(item['metadata'], dict):
+                        item_source_id = item['metadata'].get('source', '')
+                    
+                    if item_source_id == source_id_filter:
+                        filtered_results.append(item)
+                        if len(filtered_results) >= match_count:
+                            break
+                
+                print(f"[SUCCESS] Vector search completed: {len(filtered_results)} results after source filtering")
+                return filtered_results[:match_count]
+            else:
+                print(f"[SUCCESS] Vector search completed: {len(result.data)} results")
+                return result.data[:match_count]
+        else:
+            print("[WARNING] Vector search returned no results")
+            print(f"[DEBUG] RPC response data: {result.data if result else 'No result object'}")
+            return []
+            
+    except TimeoutError as e:
+        print(f"[ERROR] Vector search timed out: {e}")
         return []
+    except Exception as e:
+        print(f"[ERROR] Error searching documents: {e}")
+        print(f"[DEBUG] Exception type: {type(e).__name__}")
+        import traceback
+        print(f"[DEBUG] Traceback: {traceback.format_exc()}")
+        return []
+    finally:
+        # Cancel the timer
+        timer.cancel()
 
 
 def extract_code_blocks(markdown_content: str, min_length: int = 1000) -> List[Dict[str, Any]]:
@@ -688,9 +759,9 @@ The above content is from the documentation for '{source_id}'. Please provide a 
 
 
 def search_code_examples(
-    client: Client, 
-    query: str, 
-    match_count: int = 10, 
+    client: Client,
+    query: str,
+    match_count: int = 10,
     filter_metadata: Optional[Dict[str, Any]] = None,
     source_id: Optional[str] = None
 ) -> List[Dict[str, Any]]:
@@ -707,32 +778,88 @@ def search_code_examples(
     Returns:
         List of matching code examples
     """
-    # Create a more descriptive query for better embedding match
-    # Since code examples are embedded with their summaries, we should make the query more descriptive
-    enhanced_query = f"Code example for {query}\n\nSummary: Example code showing {query}"
+    import threading
     
-    # Create embedding for the enhanced query
-    query_embedding = create_embedding(enhanced_query)
+    # Use threading.Timer for timeout instead of signal (works in threads)
+    timeout_event = threading.Event()
     
-    # Execute the search using the match_code_examples function
+    def set_timeout():
+        timeout_event.set()
+    
+    timer = threading.Timer(25.0, set_timeout)
+    timer.start()
+    
     try:
-        # Only include filter parameter if filter_metadata is provided and not empty
+        print(f"[DEBUG] Creating enhanced embedding for code query: '{query[:50]}...'")
+        # Create a more descriptive query for better embedding match
+        # Since code examples are embedded with their summaries, we should make the query more descriptive
+        enhanced_query = f"Code example for {query}\n\nSummary: Example code showing {query}"
+        
+        # Create embedding for the enhanced query
+        query_embedding = create_embedding(enhanced_query)
+        
+        if not query_embedding or all(v == 0.0 for v in query_embedding):
+            print("[ERROR] Failed to create valid embedding for code search")
+            return []
+        
+        if timeout_event.is_set():
+            raise TimeoutError("Embedding creation timed out")
+        
+        print("[DEBUG] Executing code example search in database...")
+        # Execute the search using the match_code_examples function
         params = {
             'query_embedding': query_embedding,
-            'match_count': match_count
+            'match_count': match_count * 3 if source_id else match_count  # Get more results if we need to filter
         }
         
         # Only add the filter if it's actually provided and not empty
         if filter_metadata:
             params['filter'] = filter_metadata
+            print(f"[DEBUG] Using metadata filter: {filter_metadata}")
             
-        # Add source filter if provided
+        # Add source filter if provided (using correct parameter name from SQL function)
         if source_id:
-            params['source_filter'] = source_id
+            params['source_filter'] = source_id  # Correct parameter name from SQL function
+            print(f"[DEBUG] Using source_filter parameter: '{source_id}'")
         
         result = client.rpc('match_code_examples', params).execute()
         
-        return result.data
-    except Exception as e:
-        print(f"Error searching code examples: {e}")
+        if timeout_event.is_set():
+            raise TimeoutError("Code search timed out")
+        
+        if result and result.data:
+            print(f"[DEBUG] Code example search returned {len(result.data)} results before filtering")
+            
+            # If source_id is specified and we got results, filter them
+            if source_id and result.data:
+                # Filter results by source_id
+                filtered_results = []
+                for item in result.data:
+                    # Check if source_id matches
+                    item_source_id = item.get('source_id', '')
+                    if item_source_id == source_id:
+                        filtered_results.append(item)
+                        if len(filtered_results) >= match_count:
+                            break
+                
+                print(f"[SUCCESS] Code example search completed: {len(filtered_results)} results after source filtering")
+                return filtered_results[:match_count]
+            else:
+                print(f"[SUCCESS] Code example search completed: {len(result.data)} results")
+                return result.data[:match_count]
+        else:
+            print("[WARNING] Code example search returned no results")
+            return []
+            
+    except TimeoutError as e:
+        print(f"[ERROR] Code example search timed out: {e}")
         return []
+    except Exception as e:
+        print(f"[ERROR] Error searching code examples: {e}")
+        print(f"[DEBUG] Exception type: {type(e).__name__}")
+        import traceback
+        print(f"[DEBUG] Traceback: {traceback.format_exc()}")
+        return []
+    finally:
+        # Cancel the timer
+        timer.cancel()

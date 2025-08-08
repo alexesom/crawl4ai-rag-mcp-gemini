@@ -387,7 +387,7 @@ def process_code_example(args):
     return generate_code_example_summary(code, context_before, context_after)
 
 @mcp.tool()
-async def search(ctx: Context, query: str, return_raw_markdown: bool = False, num_results: int = 6, batch_size: int = 20, max_concurrent: int = 10) -> str:
+async def search(ctx: Context, query: str, return_raw_markdown: bool = False, num_results: int = 6, batch_size: int = 20, max_concurrent: int = 10, max_rag_workers: int = 5) -> str:
     """
     Comprehensive search tool that integrates SearXNG search with scraping and RAG functionality.
     Optionally, use `return_raw_markdown=true` to return raw markdown for more detailed analysis.
@@ -404,6 +404,7 @@ async def search(ctx: Context, query: str, return_raw_markdown: bool = False, nu
         num_results: Number of search results to return from SearXNG (default: 6)
         batch_size: Batch size for database operations (default: 20)
         max_concurrent: Maximum concurrent browser sessions for scraping (default: 10)
+        max_rag_workers: Maximum concurrent RAG query workers for parallel processing (default: 5)
     
     Returns:
         JSON string with search results, or raw markdown of each URL if `return_raw_markdown=true`
@@ -565,16 +566,44 @@ async def search(ctx: Context, query: str, return_raw_markdown: bool = False, nu
                     results_data[url] = f"Error retrieving content: {str(e)}"
         
         else:
-            # RAG mode - perform RAG query for each URL
-            for url in valid_urls:
+            # RAG mode - perform RAG query for each URL with parallel processing
+            import asyncio
+            
+            # Prepare RAG query tasks
+            async def process_rag_query_for_url(url: str):
+                """Process RAG query for a single URL."""
+                url_start_time = time.time()
+                print(f"Processing RAG query for URL: {url}")
+                
                 try:
                     # Extract source_id from URL for RAG filtering
                     parsed_url = urlparse(url)
                     source_id = parsed_url.netloc or parsed_url.path
                     
-                    # Perform RAG query using existing function
-                    rag_result_str = await perform_rag_query(ctx, query, source_id, match_count=5)
-                    rag_result = json.loads(rag_result_str)
+                    # Validate source_id
+                    if not source_id or source_id.strip() == "":
+                        print(f"Warning: Empty source_id for URL {url}, using fallback")
+                        source_id = "unknown_source"
+                    
+                    print(f"Using source_id: '{source_id}' for URL: {url}")
+                    
+                    # Perform RAG query with timeout protection (30 second timeout)
+                    try:
+                        rag_result_str = await asyncio.wait_for(
+                            perform_rag_query(ctx, query, source_id, match_count=5),
+                            timeout=30.0
+                        )
+                        print(f"RAG query completed for {url} in {time.time() - url_start_time:.2f}s")
+                    except asyncio.TimeoutError:
+                        print(f"RAG query timeout for URL: {url}")
+                        return url, "RAG query timed out after 30 seconds"
+                    
+                    # Parse JSON with error handling
+                    try:
+                        rag_result = json.loads(rag_result_str)
+                    except json.JSONDecodeError as e:
+                        print(f"JSON decode error for URL {url}: {e}")
+                        return url, f"JSON parsing error: {str(e)}"
                     
                     if rag_result.get("success", False) and rag_result.get("results"):
                         # Format RAG results for this URL
@@ -585,13 +614,37 @@ async def search(ctx: Context, query: str, return_raw_markdown: bool = False, nu
                                 "similarity": result.get("similarity", 0),
                                 "metadata": result.get("metadata", {})
                             })
-                        results_data[url] = formatted_results
-                        processed_urls += 1
+                        print(f"Successfully processed RAG results for {url}: {len(formatted_results)} results")
+                        return url, formatted_results
                     else:
-                        results_data[url] = "No RAG results found"
+                        error_msg = rag_result.get("error", "No RAG results found")
+                        print(f"No RAG results for {url}: {error_msg}")
+                        return url, f"No relevant results: {error_msg}"
                         
                 except Exception as e:
-                    results_data[url] = f"RAG query error: {str(e)}"
+                    print(f"Unexpected error processing URL {url}: {str(e)}")
+                    return url, f"RAG query error: {str(e)}"
+            
+            # Use provided max_rag_workers or get from environment or use default
+            if max_rag_workers is None:
+                max_rag_workers = int(os.getenv("MAX_RAG_WORKERS", "5"))
+            
+            # Create tasks for parallel execution with semaphore for rate limiting
+            semaphore = asyncio.Semaphore(max_rag_workers)
+            
+            async def rate_limited_rag_query(url):
+                async with semaphore:
+                    return await process_rag_query_for_url(url)
+            
+            # Execute all RAG queries in parallel
+            rag_tasks = [rate_limited_rag_query(url) for url in valid_urls]
+            rag_results = await asyncio.gather(*rag_tasks)
+            
+            # Process results
+            for url, result in rag_results:
+                results_data[url] = result
+                if isinstance(result, list):  # Successfully got results
+                    processed_urls += 1
         
         # Calculate processing statistics
         processing_time = time.time() - start_time
@@ -613,6 +666,7 @@ async def search(ctx: Context, query: str, return_raw_markdown: bool = False, nu
                 "num_results": num_results,
                 "batch_size": batch_size,
                 "max_concurrent": max_concurrent,
+                "max_rag_workers": max_rag_workers,
                 "searxng_endpoint": search_endpoint
             }
         }, indent=2)
@@ -1050,7 +1104,7 @@ async def _process_multiple_urls(
             }, indent=2)
 
 @mcp.tool()
-async def smart_crawl_url(ctx: Context, url: str, max_depth: int = 3, max_concurrent: int = 10, chunk_size: int = 5000, return_raw_markdown: bool = False, query: List[str] = None) -> str:
+async def smart_crawl_url(ctx: Context, url: str, max_depth: int = 3, max_concurrent: int = 10, chunk_size: int = 5000, return_raw_markdown: bool = False, query: List[str] = None, max_rag_workers: int = 5) -> str:
     """
     Intelligently crawl a URL based on its type and store content in Supabase.
     Enhanced with raw markdown return and RAG query capabilities.
@@ -1069,6 +1123,7 @@ async def smart_crawl_url(ctx: Context, url: str, max_depth: int = 3, max_concur
         chunk_size: Maximum size of each content chunk in characters (default: 5000)
         return_raw_markdown: If True, return raw markdown content instead of just storing (default: False)
         query: List of queries to perform RAG search on crawled content (default: None)
+        max_rag_workers: Maximum concurrent RAG query workers for parallel processing (default: 5)
     
     Returns:
         JSON string with crawl summary, raw markdown (if requested), or RAG query results
@@ -1250,11 +1305,48 @@ async def smart_crawl_url(ctx: Context, url: str, max_depth: int = 3, max_concur
                     batch_size=batch_size
                 )
         
-        # Query mode - perform RAG queries on all crawled URLs
+        # Query mode - perform RAG queries on all crawled URLs with parallel processing
         if query and len(query) > 0:
             results = {}
             total_rag_queries = 0
             
+            # Prepare all RAG query tasks for parallel execution
+            async def process_single_rag_query(doc_url: str, q: str, source_id: str):
+                """Process a single RAG query for a URL and query combination."""
+                try:
+                    # Perform RAG query using existing function
+                    rag_result_str = await perform_rag_query(ctx, q, source_id, match_count=5)
+                    rag_result = json.loads(rag_result_str)
+                    
+                    if rag_result.get("success", False) and rag_result.get("results"):
+                        # Format RAG results for this URL and query
+                        formatted_results = []
+                        for result in rag_result["results"]:
+                            formatted_results.append({
+                                "content": result.get("content", ""),
+                                "similarity": result.get("similarity", 0),
+                                "metadata": result.get("metadata", {})
+                            })
+                        return doc_url, q, formatted_results
+                    else:
+                        return doc_url, q, "No relevant results found"
+                    
+                except Exception as e:
+                    return doc_url, q, f"RAG query error: {str(e)}"
+            
+            # Use provided max_rag_workers or get from environment or use default
+            if max_rag_workers is None:
+                max_rag_workers = int(os.getenv("MAX_RAG_WORKERS", "5"))
+            
+            # Create semaphore for rate limiting
+            semaphore = asyncio.Semaphore(max_rag_workers)
+            
+            async def rate_limited_query(doc_url, q, source_id):
+                async with semaphore:
+                    return await process_single_rag_query(doc_url, q, source_id)
+            
+            # Build list of all query tasks
+            query_tasks = []
             for doc in crawl_results:
                 doc_url = doc['url']
                 # Extract source_id from URL for RAG filtering
@@ -1264,28 +1356,15 @@ async def smart_crawl_url(ctx: Context, url: str, max_depth: int = 3, max_concur
                 results[doc_url] = {}
                 
                 for q in query:
-                    try:
-                        # Perform RAG query using existing function
-                        rag_result_str = await perform_rag_query(ctx, q, source_id, match_count=5)
-                        rag_result = json.loads(rag_result_str)
-                        
-                        if rag_result.get("success", False) and rag_result.get("results"):
-                            # Format RAG results for this URL and query
-                            formatted_results = []
-                            for result in rag_result["results"]:
-                                formatted_results.append({
-                                    "content": result.get("content", ""),
-                                    "similarity": result.get("similarity", 0),
-                                    "metadata": result.get("metadata", {})
-                                })
-                            results[doc_url][q] = formatted_results
-                        else:
-                            results[doc_url][q] = "No relevant results found"
-                        
-                        total_rag_queries += 1
-                        
-                    except Exception as e:
-                        results[doc_url][q] = f"RAG query error: {str(e)}"
+                    query_tasks.append(rate_limited_query(doc_url, q, source_id))
+            
+            # Execute all queries in parallel
+            query_results = await asyncio.gather(*query_tasks)
+            
+            # Process results
+            for doc_url, q, result in query_results:
+                results[doc_url][q] = result
+                total_rag_queries += 1
             
             return json.dumps({
                 "success": True,
@@ -1295,7 +1374,8 @@ async def smart_crawl_url(ctx: Context, url: str, max_depth: int = 3, max_concur
                 "summary": {
                     "pages_crawled": len(crawl_results),
                     "queries_processed": len(query),
-                    "total_rag_queries": total_rag_queries
+                    "total_rag_queries": total_rag_queries,
+                    "max_rag_workers": max_rag_workers
                 }
             }, indent=2)
         
@@ -1385,110 +1465,237 @@ async def perform_rag_query(ctx: Context, query: str, source: str = None, match_
     Returns:
         JSON string with the search results
     """
+    import asyncio
+    
+    query_start_time = time.time()
+    
     try:
+        print(f"Starting RAG query: '{query}' with source filter: '{source}'")
+        
+        # Input validation
+        if not query or not query.strip():
+            return json.dumps({
+                "success": False,
+                "error": "Query cannot be empty"
+            }, indent=2)
+        
+        if match_count <= 0:
+            match_count = 5
+        elif match_count > 50:  # Reasonable limit
+            match_count = 50
+        
+        # Validate and sanitize source filter
+        if source:
+            source = source.strip()
+            if not source:
+                source = None
+            elif len(source) > 200:  # Reasonable limit
+                return json.dumps({
+                    "success": False,
+                    "error": "Source filter too long (max 200 characters)"
+                }, indent=2)
+        
         # Get the Supabase client from the context
         supabase_client = ctx.request_context.lifespan_context.supabase_client
+        
+        if not supabase_client:
+            return json.dumps({
+                "success": False,
+                "error": "Database client not available"
+            }, indent=2)
         
         # Check if hybrid search is enabled
         use_hybrid_search = os.getenv("USE_HYBRID_SEARCH", "false") == "true"
         
-        # Prepare filter if source is provided and not empty
-        filter_metadata = None
-        if source and source.strip():
-            filter_metadata = {"source": source}
+        # Prepare source filter if source is provided and not empty
+        # The source parameter should be the source_id (domain) not full URL
+        if source:
+            print(f"[DEBUG] Using source filter: '{source}'")
+        
+        results = []
         
         if use_hybrid_search:
-            # Hybrid search: combine vector and keyword search
-            
-            # 1. Get vector search results (get more to account for filtering)
-            vector_results = search_documents(
-                client=supabase_client,
-                query=query,
-                match_count=match_count * 2,  # Get double to have room for filtering
-                filter_metadata=filter_metadata
-            )
-            
-            # 2. Get keyword search results using ILIKE
-            keyword_query = supabase_client.from_('crawled_pages')\
-                .select('id, url, chunk_number, content, metadata, source_id')\
-                .ilike('content', f'%{query}%')
-            
-            # Apply source filter if provided
-            if source and source.strip():
-                keyword_query = keyword_query.eq('source_id', source)
-            
-            # Execute keyword search
-            keyword_response = keyword_query.limit(match_count * 2).execute()
-            keyword_results = keyword_response.data if keyword_response.data else []
-            
-            # 3. Combine results with preference for items appearing in both
-            seen_ids = set()
-            combined_results = []
-            
-            # First, add items that appear in both searches (these are the best matches)
-            vector_ids = {r.get('id') for r in vector_results if r.get('id')}
-            for kr in keyword_results:
-                if kr['id'] in vector_ids and kr['id'] not in seen_ids:
-                    # Find the vector result to get similarity score
+            print("[DEBUG] Using hybrid search mode")
+            try:
+                # Hybrid search: combine vector and keyword search with timeout protection
+                
+                # 1. Get vector search results with timeout (15 seconds)
+                print("[DEBUG] Executing vector search...")
+                try:
+                    vector_results = await asyncio.wait_for(
+                        asyncio.get_event_loop().run_in_executor(
+                            None,
+                            lambda: search_documents(
+                                client=supabase_client,
+                                query=query,
+                                match_count=match_count * 2,  # Get double to have room for filtering
+                                source_id_filter=source  # Use source_id_filter instead of filter_metadata
+                            )
+                        ),
+                        timeout=15.0
+                    )
+                    print(f"Vector search completed: {len(vector_results)} results")
+                except asyncio.TimeoutError:
+                    print("Vector search timed out, falling back to keyword search only")
+                    vector_results = []
+                except Exception as e:
+                    print(f"Vector search failed: {e}, falling back to keyword search only")
+                    vector_results = []
+                
+                # 2. Get keyword search results with timeout (10 seconds)
+                print("Executing keyword search...")
+                try:
+                    keyword_query = supabase_client.from_('crawled_pages')\
+                        .select('id, url, chunk_number, content, metadata, source_id')\
+                        .ilike('content', f'%{query}%')
+                    
+                    # Apply source filter if provided
+                    if source:
+                        keyword_query = keyword_query.eq('source_id', source)
+                    
+                    # Execute keyword search with timeout
+                    keyword_response = await asyncio.wait_for(
+                        asyncio.get_event_loop().run_in_executor(
+                            None,
+                            lambda: keyword_query.limit(match_count * 2).execute()
+                        ),
+                        timeout=10.0
+                    )
+                    keyword_results = keyword_response.data if keyword_response.data else []
+                    print(f"Keyword search completed: {len(keyword_results)} results")
+                except asyncio.TimeoutError:
+                    print("Keyword search timed out")
+                    keyword_results = []
+                except Exception as e:
+                    print(f"Keyword search failed: {e}")
+                    keyword_results = []
+                
+                # 3. Combine results with preference for items appearing in both
+                if vector_results or keyword_results:
+                    seen_ids = set()
+                    combined_results = []
+                    
+                    # First, add items that appear in both searches (these are the best matches)
+                    vector_ids = {r.get('id') for r in vector_results if r.get('id')}
+                    for kr in keyword_results:
+                        if kr['id'] in vector_ids and kr['id'] not in seen_ids:
+                            # Find the vector result to get similarity score
+                            for vr in vector_results:
+                                if vr.get('id') == kr['id']:
+                                    # Boost similarity score for items in both results
+                                    vr['similarity'] = min(1.0, vr.get('similarity', 0) * 1.2)
+                                    combined_results.append(vr)
+                                    seen_ids.add(kr['id'])
+                                    break
+                    
+                    # Then add remaining vector results (semantic matches without exact keyword)
                     for vr in vector_results:
-                        if vr.get('id') == kr['id']:
-                            # Boost similarity score for items in both results
-                            vr['similarity'] = min(1.0, vr.get('similarity', 0) * 1.2)
+                        if vr.get('id') and vr['id'] not in seen_ids and len(combined_results) < match_count:
                             combined_results.append(vr)
+                            seen_ids.add(vr['id'])
+                    
+                    # Finally, add pure keyword matches if we still need more results
+                    for kr in keyword_results:
+                        if kr['id'] not in seen_ids and len(combined_results) < match_count:
+                            # Convert keyword result to match vector result format
+                            combined_results.append({
+                                'id': kr['id'],
+                                'url': kr['url'],
+                                'chunk_number': kr['chunk_number'],
+                                'content': kr['content'],
+                                'metadata': kr['metadata'],
+                                'source_id': kr['source_id'],
+                                'similarity': 0.5  # Default similarity for keyword-only matches
+                            })
                             seen_ids.add(kr['id'])
-                            break
-            
-            # Then add remaining vector results (semantic matches without exact keyword)
-            for vr in vector_results:
-                if vr.get('id') and vr['id'] not in seen_ids and len(combined_results) < match_count:
-                    combined_results.append(vr)
-                    seen_ids.add(vr['id'])
-            
-            # Finally, add pure keyword matches if we still need more results
-            for kr in keyword_results:
-                if kr['id'] not in seen_ids and len(combined_results) < match_count:
-                    # Convert keyword result to match vector result format
-                    combined_results.append({
-                        'id': kr['id'],
-                        'url': kr['url'],
-                        'chunk_number': kr['chunk_number'],
-                        'content': kr['content'],
-                        'metadata': kr['metadata'],
-                        'source_id': kr['source_id'],
-                        'similarity': 0.5  # Default similarity for keyword-only matches
-                    })
-                    seen_ids.add(kr['id'])
-            
-            # Use combined results
-            results = combined_results[:match_count]
-            
-        else:
-            # Standard vector search only
-            results = search_documents(
-                client=supabase_client,
-                query=query,
-                match_count=match_count,
-                filter_metadata=filter_metadata
-            )
+                    
+                    # Use combined results
+                    results = combined_results[:match_count]
+                    print(f"Hybrid search combined: {len(results)} final results")
+                else:
+                    print("No results from either vector or keyword search")
+                    results = []
+                    
+            except Exception as e:
+                print(f"Hybrid search failed: {e}, falling back to vector search")
+                use_hybrid_search = False
         
-        # Apply reranking if enabled
+        if not use_hybrid_search:
+            print("[DEBUG] Using vector search only")
+            try:
+                # Standard vector search with timeout protection (20 seconds)
+                results = await asyncio.wait_for(
+                    asyncio.get_event_loop().run_in_executor(
+                        None,
+                        lambda: search_documents(
+                            client=supabase_client,
+                            query=query,
+                            match_count=match_count,
+                            source_id_filter=source  # Use source_id_filter instead of filter_metadata
+                        )
+                    ),
+                    timeout=20.0
+                )
+                print(f"Vector search completed: {len(results)} results")
+            except asyncio.TimeoutError:
+                print("Vector search timed out")
+                return json.dumps({
+                    "success": False,
+                    "query": query,
+                    "error": "Search query timed out after 20 seconds. Try reducing match_count or simplifying the query."
+                }, indent=2)
+            except Exception as e:
+                print(f"Vector search failed: {e}")
+                return json.dumps({
+                    "success": False,
+                    "query": query,
+                    "error": f"Database search failed: {str(e)}"
+                }, indent=2)
+        
+        # Apply reranking if enabled and we have results
         use_reranking = os.getenv("USE_RERANKING", "false") == "true"
-        if use_reranking and ctx.request_context.lifespan_context.reranking_model:
-            results = rerank_results(ctx.request_context.lifespan_context.reranking_model, query, results, content_key="content")
+        if use_reranking and results and ctx.request_context.lifespan_context.reranking_model:
+            try:
+                print("Applying reranking...")
+                reranked_results = await asyncio.wait_for(
+                    asyncio.get_event_loop().run_in_executor(
+                        None,
+                        lambda: rerank_results(
+                            ctx.request_context.lifespan_context.reranking_model,
+                            query,
+                            results,
+                            content_key="content"
+                        )
+                    ),
+                    timeout=10.0
+                )
+                results = reranked_results
+                print("Reranking completed")
+            except asyncio.TimeoutError:
+                print("Reranking timed out, using original results")
+            except Exception as e:
+                print(f"Reranking failed: {e}, using original results")
         
         # Format the results
         formatted_results = []
         for result in results:
-            formatted_result = {
-                "url": result.get("url"),
-                "content": result.get("content"),
-                "metadata": result.get("metadata"),
-                "similarity": result.get("similarity")
-            }
-            # Include rerank score if available
-            if "rerank_score" in result:
-                formatted_result["rerank_score"] = result["rerank_score"]
-            formatted_results.append(formatted_result)
+            try:
+                formatted_result = {
+                    "url": result.get("url", ""),
+                    "content": result.get("content", ""),
+                    "metadata": result.get("metadata", {}),
+                    "similarity": result.get("similarity", 0.0)
+                }
+                # Include rerank score if available
+                if "rerank_score" in result:
+                    formatted_result["rerank_score"] = result["rerank_score"]
+                formatted_results.append(formatted_result)
+            except Exception as e:
+                print(f"Error formatting result: {e}")
+                continue
+        
+        processing_time = time.time() - query_start_time
+        print(f"RAG query completed in {processing_time:.2f}s with {len(formatted_results)} results")
         
         return json.dumps({
             "success": True,
@@ -1497,13 +1704,19 @@ async def perform_rag_query(ctx: Context, query: str, source: str = None, match_
             "search_mode": "hybrid" if use_hybrid_search else "vector",
             "reranking_applied": use_reranking and ctx.request_context.lifespan_context.reranking_model is not None,
             "results": formatted_results,
-            "count": len(formatted_results)
+            "count": len(formatted_results),
+            "processing_time_seconds": round(processing_time, 2)
         }, indent=2)
+        
     except Exception as e:
+        processing_time = time.time() - query_start_time
+        print(f"RAG query failed after {processing_time:.2f}s: {e}")
         return json.dumps({
             "success": False,
             "query": query,
-            "error": str(e)
+            "source_filter": source,
+            "error": f"Search operation failed: {str(e)}",
+            "processing_time_seconds": round(processing_time, 2)
         }, indent=2)
 
 @mcp.tool()
