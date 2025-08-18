@@ -24,6 +24,7 @@ import re
 import concurrent.futures
 import sys
 import time
+import torch
 
 from crawl4ai import AsyncWebCrawler, BrowserConfig, CrawlerRunConfig, CacheMode, MemoryAdaptiveDispatcher
 
@@ -151,7 +152,15 @@ async def crawl4ai_lifespan(server: FastMCP) -> AsyncIterator[Crawl4AIContext]:
     reranking_model = None
     if os.getenv("USE_RERANKING", "false") == "true":
         try:
-            reranking_model = CrossEncoder("cross-encoder/ms-marco-MiniLM-L-6-v2")
+            # Detect appropriate device
+            if torch.cuda.is_available():
+                device = 'cuda'
+            elif torch.backends.mps.is_available():
+                device = 'mps'
+            else:
+                device = 'cpu'
+            print(f"Using device: {device}")
+            reranking_model = CrossEncoder("cross-encoder/ms-marco-MiniLM-L-6-v2", device=device)
         except Exception as e:
             print(f"Failed to load reranking model: {e}")
             reranking_model = None
@@ -221,7 +230,7 @@ mcp = FastMCP(
     description="MCP server for RAG and web crawling with Crawl4AI",
     lifespan=crawl4ai_lifespan,
     host=os.getenv("HOST", "0.0.0.0"),
-    port=os.getenv("PORT", "8051")
+    port=int(os.getenv("PORT", "8051"))
 )
 
 def rerank_results(model: CrossEncoder, query: str, results: List[Dict[str, Any]], content_key: str = "content") -> List[Dict[str, Any]]:
@@ -2563,13 +2572,16 @@ async def crawl_markdown_file(crawler: AsyncWebCrawler, url: str) -> List[Dict[s
     Returns:
         List of dictionaries with URL and markdown content
     """
-    crawl_config = CrawlerRunConfig()
-
-    result = await crawler.arun(url=url, config=crawl_config)
-    if result.success and result.markdown:
-        return [{'url': url, 'markdown': result.markdown}]
-    else:
-        print(f"Failed to crawl {url}: {result.error_message}")
+    crawl_config = CrawlerRunConfig(page_timeout=30000)
+    try:
+        result = await crawler.arun(url=url, config=crawl_config)
+        if result.success and result.markdown:
+            return [{'url': url, 'markdown': result.markdown}]
+        else:
+            print(f"Failed to crawl {url}: {result.error_message}")
+            return []
+    except Exception as e:
+        print(f"Error crawling markdown file {url}: {e}")
         return []
 
 async def crawl_batch(crawler: AsyncWebCrawler, urls: List[str], max_concurrent: int = 10) -> List[Dict[str, Any]]:
@@ -2584,15 +2596,18 @@ async def crawl_batch(crawler: AsyncWebCrawler, urls: List[str], max_concurrent:
     Returns:
         List of dictionaries with URL and markdown content
     """
-    crawl_config = CrawlerRunConfig(cache_mode=CacheMode.BYPASS, stream=False)
+    crawl_config = CrawlerRunConfig(cache_mode=CacheMode.BYPASS, stream=False, page_timeout=30000)
     dispatcher = MemoryAdaptiveDispatcher(
         memory_threshold_percent=70.0,
         check_interval=1.0,
         max_session_permit=max_concurrent
     )
-
-    results = await crawler.arun_many(urls=urls, config=crawl_config, dispatcher=dispatcher)
-    return [{'url': r.url, 'markdown': r.markdown, 'links': r.links} for r in results if r.success and r.markdown]
+    try:
+        results = await crawler.arun_many(urls=urls, config=crawl_config, dispatcher=dispatcher)
+        return [{'url': r.url, 'markdown': r.markdown, 'links': r.links} for r in results if r.success and r.markdown]
+    except Exception as e:
+        print(f"Error during batch crawl: {e}")
+        return []
 
 async def crawl_recursive_internal_links(crawler: AsyncWebCrawler, start_urls: List[str], max_depth: int = 3, max_concurrent: int = 10) -> List[Dict[str, Any]]:
     """
@@ -2607,7 +2622,7 @@ async def crawl_recursive_internal_links(crawler: AsyncWebCrawler, start_urls: L
     Returns:
         List of dictionaries with URL and markdown content
     """
-    run_config = CrawlerRunConfig(cache_mode=CacheMode.BYPASS, stream=False)
+    run_config = CrawlerRunConfig(cache_mode=CacheMode.BYPASS, stream=False, page_timeout=30000)
     dispatcher = MemoryAdaptiveDispatcher(
         memory_threshold_percent=70.0,
         check_interval=1.0,
@@ -2627,7 +2642,11 @@ async def crawl_recursive_internal_links(crawler: AsyncWebCrawler, start_urls: L
         if not urls_to_crawl:
             break
 
-        results = await crawler.arun_many(urls=urls_to_crawl, config=run_config, dispatcher=dispatcher)
+        try:
+            results = await crawler.arun_many(urls=urls_to_crawl, config=run_config, dispatcher=dispatcher)
+        except Exception as e:
+            print(f"Error during recursive crawl at depth {depth}: {e}")
+            results = []
         next_level_urls = set()
 
         for result in results:
