@@ -16,10 +16,12 @@ from xml.etree import ElementTree
 from dotenv import load_dotenv
 from supabase import Client
 from pathlib import Path
+from types import SimpleNamespace
 import requests
 import asyncio
 import json
 import os
+import asyncio
 import re
 import concurrent.futures
 import sys
@@ -55,7 +57,35 @@ project_root = Path(__file__).resolve().parent.parent
 dotenv_path = project_root / '.env'
 
 # Force override of existing environment variables
-load_dotenv(dotenv_path, override=True)
+load_dotenv(dotenv_path)
+
+_init_lock = asyncio.Lock()
+_singletons = SimpleNamespace(crawler=None, reranker=None)
+_printed = set()
+
+def _print_once(msg):
+    if msg not in _printed:
+        print(msg, flush=True)
+        _printed.add(msg)
+
+async def get_singletons():
+    async with _init_lock:
+        if _singletons.crawler is None:
+            bc = BrowserConfig(headless=True, verbose=False)
+            _singletons.crawler = AsyncWebCrawler(config=bc)
+            await _singletons.crawler.__aenter__()
+
+        if os.getenv("USE_RERANKING", "false").lower() == "true" and _singletons.reranker is None:
+            if torch.cuda.is_available():
+                device = "cuda"
+            elif torch.backends.mps.is_available():
+                device = "mps"
+            else:
+                device = "cpu"
+            _print_once(f"Using device: {device}")
+            _singletons.reranker = CrossEncoder("cross-encoder/ms-marco-MiniLM-L-6-v2", device=device)
+    return _singletons
+
 
 # Helper functions for Neo4j validation and error handling
 def validate_neo4j_connection() -> bool:
@@ -135,35 +165,15 @@ async def crawl4ai_lifespan(server: FastMCP) -> AsyncIterator[Crawl4AIContext]:
     Yields:
         Crawl4AIContext: The context containing the Crawl4AI crawler and Supabase client
     """
-    # Create browser configuration
-    browser_config = BrowserConfig(
-        headless=True,
-        verbose=False
-    )
-    
-    # Initialize the crawler
-    crawler = AsyncWebCrawler(config=browser_config)
-    await crawler.__aenter__()
-    
     # Initialize Supabase client
     supabase_client = get_supabase_client()
+
+    # Get singletons (crawler and reranker)
+    singletons = await get_singletons()
     
     # Initialize cross-encoder model for reranking if enabled
-    reranking_model = None
-    if os.getenv("USE_RERANKING", "false") == "true":
-        try:
-            # Detect appropriate device
-            if torch.cuda.is_available():
-                device = 'cuda'
-            elif torch.backends.mps.is_available():
-                device = 'mps'
-            else:
-                device = 'cpu'
-            print(f"Using device: {device}")
-            reranking_model = CrossEncoder("cross-encoder/ms-marco-MiniLM-L-6-v2", device=device)
-        except Exception as e:
-            print(f"Failed to load reranking model: {e}")
-            reranking_model = None
+    reranking_model = singletons.reranker if os.getenv("USE_RERANKING", "false").lower() == "true" else None
+    crawler = singletons.crawler
     
     # Initialize Neo4j components if configured and enabled
     knowledge_validator = None
