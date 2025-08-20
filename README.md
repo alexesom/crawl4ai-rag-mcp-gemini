@@ -117,24 +117,45 @@ This is a **Docker-only solution** - no Python environment setup required!
 4. **Edit your MCP config:**
    ```json
     "crawl4ai-rag": {
-      "command": "npx",
-      "args": ["mcp-remote", "http://localhost:8051/sse"]
+      "type": "sse",
+      "url": "http://localhost:8051/sse"
     }
    ```
 
 #### Using STDIO transport:
 
 3. **Create virtual environment:**
-    ```bash
-   docker compose up -d
-   ```
+##### Unix / macOS (bash):
+  ```bash
+  # create venv
+  python3 -m venv .venv
+
+  # activate
+  source .venv/bin/activate
+
+  # upgrade pip and install in editable mode
+  pip install --upgrade pip
+  pip install -e .
+```
+##### Windows (PowerShell):
+  ```powershell
+  # create venv
+  python -m venv .venv
+
+  # activate (PowerShell)
+  . .\.venv\Scripts\Activate.ps1
+
+  # upgrade pip and install
+  python -m pip install --upgrade pip
+  pip install -e .
+  ```
 
 4. **Edit your MCP config:**
    ```json
     "crawl4ai-rag": {
       "command": "/absolute/path/to/your/virtualenv/.venv/bin/python",
       "args": ["/absolute/path/to/repo/crawl4ai-rag-mcp-gemini/src/crawl4ai_mcp.py"],
-      "envFile": "absolute/path/to/envfile/.env"
+      "envFile": "absolute/path/to/stdio/envfile/.env"
     }
    ```
 

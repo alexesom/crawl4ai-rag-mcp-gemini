@@ -13,7 +13,6 @@
         "SEARXNG_USER_AGENT": "MCP-Crawl4AI-RAG-Server/1.0",
         "SEARXNG_DEFAULT_ENGINES": "google,bing,duckduckgo",
         "SEARXNG_TIMEOUT": "30",
-        "SEARXNG_HOSTNAME": "http://localhost",
         "USE_CONTEXTUAL_EMBEDDINGS": "true",
         "USE_HYBRID_SEARCH": "true",
         "USE_AGENTIC_RAG": "false",
