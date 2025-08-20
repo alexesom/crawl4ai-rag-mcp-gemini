@@ -68,7 +68,7 @@ dotenv_path = project_root / '.env'
 load_dotenv(dotenv_path)
 
 _init_lock = asyncio.Lock()
-_singletons = SimpleNamespace(crawler=None, reranker=None, web_crawler=None)
+_singletons = SimpleNamespace(adaptive_crawler=None, reranker=None, web_crawler=None)
 _printed = set()
 
 def _print_once(msg):
@@ -78,7 +78,7 @@ def _print_once(msg):
 
 async def get_singletons():
     async with _init_lock:
-        if _singletons.crawler is None:
+        if _singletons.adaptive_crawler is None:
             bc = BrowserConfig(headless=True, verbose=False)
 
             web_crawler = AsyncWebCrawler(config=bc)
@@ -91,9 +91,9 @@ async def get_singletons():
                 embedding_min_confidence_threshold=0.3
             )
 
-            adaptiveCrawler = AdaptiveCrawler(web_crawler, config)
+            adaptive_crawler = AdaptiveCrawler(web_crawler, config)
 
-            _singletons.crawler = adaptiveCrawler
+            _singletons.adaptive_crawler = adaptive_crawler
             _singletons.web_crawler = web_crawler
 
         if os.getenv("USE_RERANKING", "false").lower() == "true" and _singletons.reranker is None:
@@ -169,7 +169,7 @@ def validate_github_url(repo_url: str) -> Dict[str, Any]:
 @dataclass
 class Crawl4AIContext:
     """Context for the Crawl4AI MCP server."""
-    crawler: AdaptiveCrawler
+    adaptive_crawler: AdaptiveCrawler
     web_crawler: AsyncWebCrawler
     supabase_client: Client
     reranking_model: Optional[CrossEncoder] = None
@@ -190,12 +190,12 @@ async def crawl4ai_lifespan(server: FastMCP) -> AsyncIterator[Crawl4AIContext]:
     # Initialize Supabase client
     supabase_client = get_supabase_client()
 
-    # Get singletons (crawler and reranker)
+    # Get singletons (adaptive_crawler and reranker and web_crawler)
     singletons = await get_singletons()
     
     # Initialize cross-encoder model for reranking if enabled
     reranking_model = singletons.reranker if os.getenv("USE_RERANKING", "false").lower() == "true" else None
-    crawler = singletons.crawler
+    adaptive_crawler = singletons.adaptive_crawler
     web_crawler = singletons.web_crawler
     
     # Initialize Neo4j components if configured and enabled
@@ -235,7 +235,7 @@ async def crawl4ai_lifespan(server: FastMCP) -> AsyncIterator[Crawl4AIContext]:
     
     try:
         yield Crawl4AIContext(
-            crawler=crawler,
+            adaptive_crawler=adaptive_crawler,
             web_crawler=web_crawler,
             supabase_client=supabase_client,
             reranking_model=reranking_model,
@@ -808,7 +808,7 @@ async def scrape_urls(ctx: Context, url: Union[str, List[str]], max_concurrent: 
 
 
 async def _process_multiple_urls(
-    crawler: AsyncWebCrawler,
+    web_crawler: AsyncWebCrawler,
     supabase_client: Client,
     urls: List[str],
     max_concurrent: int,
@@ -824,7 +824,7 @@ async def _process_multiple_urls(
     enhanced performance and error handling for all cases.
     
     Args:
-        crawler: AsyncWebCrawler instance
+        web_crawler: AsyncWebCrawler instance
         supabase_client: Supabase client
         urls: List of URLs to process (can be single URL or multiple)
         max_concurrent: Maximum concurrent browser sessions
@@ -836,7 +836,7 @@ async def _process_multiple_urls(
     """
     try:
         # Batch crawl all URLs using existing infrastructure
-        crawl_results = await crawl_batch(crawler, urls, max_concurrent=max_concurrent)
+        crawl_results = await crawl_batch(web_crawler, urls, max_concurrent=max_concurrent)
         
         # Raw markdown mode - return immediately without storing
         if return_raw_markdown:
@@ -1174,8 +1174,8 @@ async def smart_crawl_url(ctx: Context, url: str, max_depth: int = 3, max_concur
         JSON string with crawl summary, raw markdown (if requested), or RAG query results
     """
     try:
-        # Get the crawler from the context
-        crawler = ctx.request_context.lifespan_context.crawler
+        # Get the Adaptive Crawler from the context
+        adaptive_crawler = ctx.request_context.lifespan_context.adaptive_crawler
         supabase_client = ctx.request_context.lifespan_context.supabase_client
         
         # Determine the crawl strategy
@@ -1184,7 +1184,7 @@ async def smart_crawl_url(ctx: Context, url: str, max_depth: int = 3, max_concur
         
         if is_txt(url):
             # For text files, use simple crawl
-            crawl_results = await crawl_markdown_file(crawler, url)
+            crawl_results = await crawl_markdown_file(adaptive_crawler, url)
             crawl_type = "text_file"
         elif is_sitemap(url):
             # For sitemaps, extract URLs and crawl in parallel
@@ -1195,13 +1195,13 @@ async def smart_crawl_url(ctx: Context, url: str, max_depth: int = 3, max_concur
                     "url": url,
                     "error": "No URLs found in sitemap"
                 }, indent=2)
-            crawl_results = await crawl_batch(crawler, sitemap_urls, max_concurrent=max_concurrent)
+            crawl_results = await crawl_batch(adaptive_crawler, sitemap_urls, max_concurrent=max_concurrent)
             crawl_type = "sitemap"
         else:
             web_crawler = ctx.request_context.lifespan_context.web_crawler
             # For regular URLs, use adaptive crawl if query is provided, otherwise recursive
             if query:
-                result = await crawler.digest(start_url=url, query=" ".join(query))
+                result = await adaptive_crawler.digest(start_url=url, query=" ".join(query))
                 crawl_results = [{'url': r.url, 'markdown': r.markdown, 'links': r.links} for r in result.crawled_urls if r.success and r.markdown]
                 crawl_type = "adaptive_webpage"
             else:
@@ -2604,12 +2604,12 @@ async def parse_github_repository(ctx: Context, repo_url: str) -> str:
             "error": f"Repository parsing failed: {str(e)}"
         }, indent=2)
 
-async def crawl_markdown_file(crawler: AsyncWebCrawler, url: str) -> List[Dict[str, Any]]:
+async def crawl_markdown_file(web_crawler: AsyncWebCrawler, url: str) -> List[Dict[str, Any]]:
     """
     Crawl a .txt or markdown file.
     
     Args:
-        crawler: AsyncWebCrawler instance
+        web_crawler: AsyncWebCrawler instance
         url: URL of the file
         
     Returns:
@@ -2617,7 +2617,7 @@ async def crawl_markdown_file(crawler: AsyncWebCrawler, url: str) -> List[Dict[s
     """
     crawl_config = CrawlerRunConfig(page_timeout=30000)
     try:
-        result = await crawler.arun(url=url, config=crawl_config)
+        result = await web_crawler.arun(url=url, config=crawl_config)
         if result.success and result.markdown:
             return [{'url': url, 'markdown': result.markdown}]
         else:
@@ -2627,7 +2627,7 @@ async def crawl_markdown_file(crawler: AsyncWebCrawler, url: str) -> List[Dict[s
         print(f"Error crawling markdown file {url}: {e}")
         return []
 
-async def crawl_batch(crawler: AsyncWebCrawler, urls: List[str], max_concurrent: int = 10) -> List[Dict[str, Any]]:
+async def crawl_batch(web_crawler: AsyncWebCrawler, urls: List[str], max_concurrent: int = 10) -> List[Dict[str, Any]]:
     """
     Batch crawl multiple URLs in parallel.
     
@@ -2646,13 +2646,13 @@ async def crawl_batch(crawler: AsyncWebCrawler, urls: List[str], max_concurrent:
         max_session_permit=max_concurrent
     )
     try:
-        results = await crawler.arun_many(urls=urls, config=crawl_config, dispatcher=dispatcher)
+        results = await web_crawler.arun_many(urls=urls, config=crawl_config, dispatcher=dispatcher)
         return [{'url': r.url, 'markdown': r.markdown, 'links': r.links} for r in results if r.success and r.markdown]
     except Exception as e:
         print(f"Error during batch crawl: {e}")
         return []
 
-async def crawl_recursive_internal_links(crawler: AsyncWebCrawler, start_urls: List[str], max_depth: int = 3, max_concurrent: int = 10) -> List[Dict[str, Any]]:
+async def crawl_recursive_internal_links(web_crawler: AsyncWebCrawler, start_urls: List[str], max_depth: int = 3, max_concurrent: int = 10) -> List[Dict[str, Any]]:
     """
     Recursively crawl internal links from start URLs up to a maximum depth.
     
@@ -2686,7 +2686,7 @@ async def crawl_recursive_internal_links(crawler: AsyncWebCrawler, start_urls: L
             break
 
         try:
-            results = await crawler.arun_many(urls=urls_to_crawl, config=run_config, dispatcher=dispatcher)
+            results = await web_crawler.arun_many(urls=urls_to_crawl, config=run_config, dispatcher=dispatcher)
         except Exception as e:
             print(f"Error during recursive crawl at depth {depth}: {e}")
             results = []
