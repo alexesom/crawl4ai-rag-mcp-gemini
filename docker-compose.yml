@@ -40,7 +40,7 @@ services:
       - "443:443"
       - "443:443/udp"
     environment:
-      - SEARXNG_BASE_URL=http://${SEARXNG_HOSTNAME:-localhost}
+      - SEARXNG_BASE_URL=${SEARXNG_HOSTNAME:-localhost}
       - SEARXNG_TLS=${SEARXNG_TLS:-internal}
     volumes:
       - ./Caddyfile:/etc/caddy/Caddyfile:ro
@@ -107,6 +107,7 @@ services:
 networks:
   searxng:
     driver: bridge
+    enable_ipv6: false
 
 volumes:
   caddy-data:
