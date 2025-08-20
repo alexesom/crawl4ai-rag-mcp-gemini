@@ -28,7 +28,15 @@ import sys
 import time
 import torch
 
-from crawl4ai import AsyncWebCrawler, BrowserConfig, CrawlerRunConfig, CacheMode, MemoryAdaptiveDispatcher
+from crawl4ai import (
+    AsyncWebCrawler,
+    BrowserConfig,
+    CrawlerRunConfig,
+    CacheMode,
+    MemoryAdaptiveDispatcher,
+    AdaptiveConfig,
+    AdaptiveCrawler
+)
 
 # Add knowledge_graphs folder to path for importing knowledge graph modules
 knowledge_graphs_path = Path(__file__).resolve().parent.parent / 'knowledge_graphs'
@@ -60,7 +68,7 @@ dotenv_path = project_root / '.env'
 load_dotenv(dotenv_path)
 
 _init_lock = asyncio.Lock()
-_singletons = SimpleNamespace(crawler=None, reranker=None)
+_singletons = SimpleNamespace(crawler=None, reranker=None, web_crawler=None)
 _printed = set()
 
 def _print_once(msg):
@@ -72,8 +80,21 @@ async def get_singletons():
     async with _init_lock:
         if _singletons.crawler is None:
             bc = BrowserConfig(headless=True, verbose=False)
-            _singletons.crawler = AsyncWebCrawler(config=bc)
-            await _singletons.crawler.__aenter__()
+
+            web_crawler = AsyncWebCrawler(config=bc)
+            await web_crawler.__aenter__()
+
+            config = AdaptiveConfig(
+                strategy="embedding",
+                embedding_model="sentence-transformers/all-MiniLM-L6-v2",
+                n_query_variations=10,
+                embedding_min_confidence_threshold=0.3
+            )
+
+            adaptiveCrawler = AdaptiveCrawler(web_crawler, config)
+
+            _singletons.crawler = adaptiveCrawler
+            _singletons.web_crawler = web_crawler
 
         if os.getenv("USE_RERANKING", "false").lower() == "true" and _singletons.reranker is None:
             if torch.cuda.is_available():
@@ -148,7 +169,8 @@ def validate_github_url(repo_url: str) -> Dict[str, Any]:
 @dataclass
 class Crawl4AIContext:
     """Context for the Crawl4AI MCP server."""
-    crawler: AsyncWebCrawler
+    crawler: AdaptiveCrawler
+    web_crawler: AsyncWebCrawler
     supabase_client: Client
     reranking_model: Optional[CrossEncoder] = None
     knowledge_validator: Optional[Any] = None  # KnowledgeGraphValidator when available
@@ -174,6 +196,7 @@ async def crawl4ai_lifespan(server: FastMCP) -> AsyncIterator[Crawl4AIContext]:
     # Initialize cross-encoder model for reranking if enabled
     reranking_model = singletons.reranker if os.getenv("USE_RERANKING", "false").lower() == "true" else None
     crawler = singletons.crawler
+    web_crawler = singletons.web_crawler
     
     # Initialize Neo4j components if configured and enabled
     knowledge_validator = None
@@ -213,6 +236,7 @@ async def crawl4ai_lifespan(server: FastMCP) -> AsyncIterator[Crawl4AIContext]:
     try:
         yield Crawl4AIContext(
             crawler=crawler,
+            web_crawler=web_crawler,
             supabase_client=supabase_client,
             reranking_model=reranking_model,
             knowledge_validator=knowledge_validator,
@@ -220,7 +244,8 @@ async def crawl4ai_lifespan(server: FastMCP) -> AsyncIterator[Crawl4AIContext]:
         )
     finally:
         # Clean up all components
-        await crawler.__aexit__(None, None, None)
+        if _singletons.web_crawler:
+            await _singletons.web_crawler.__aexit__(None, None, None)
         if knowledge_validator:
             try:
                 await knowledge_validator.close()
@@ -321,7 +346,7 @@ def parse_sitemap(sitemap_url: str) -> List[str]:
     if resp.status_code == 200:
         try:
             tree = ElementTree.fromstring(resp.content)
-            urls = [loc.text for loc in tree.findall('.//{*}loc')]
+            urls = [loc.text for loc in tree.findall('.//{*}loc') if loc.text is not None]
         except Exception as e:
             print(f"Error parsing sitemap XML: {e}")
 
@@ -763,12 +788,12 @@ async def scrape_urls(ctx: Context, url: Union[str, List[str]], max_concurrent: 
             }, indent=2)
         
         # Get context components
-        crawler = ctx.request_context.lifespan_context.crawler
+        web_crawler = ctx.request_context.lifespan_context.web_crawler
         supabase_client = ctx.request_context.lifespan_context.supabase_client
         
         # Always use unified processing (handles both single and multiple URLs seamlessly)
         return await _process_multiple_urls(
-            crawler, supabase_client, urls_to_process,
+            web_crawler, supabase_client, urls_to_process,
             max_concurrent, batch_size, start_time, return_raw_markdown
         )
             
@@ -906,7 +931,8 @@ async def _process_multiple_urls(
                         meta["url"] = original_url
                         meta["source"] = source_id
                         meta["crawl_type"] = "multi_url"
-                        meta["crawl_time"] = str(asyncio.current_task().get_coro().__name__)
+                        task = asyncio.current_task()
+                        meta["crawl_time"] = task.get_name() if task else "unknown"
                         all_metadatas.append(meta)
                         
                         # Accumulate word counts
@@ -1123,7 +1149,7 @@ async def _process_multiple_urls(
             }, indent=2)
 
 @mcp.tool()
-async def smart_crawl_url(ctx: Context, url: str, max_depth: int = 3, max_concurrent: int = 10, chunk_size: int = 5000, return_raw_markdown: bool = False, query: List[str] = None, max_rag_workers: int = 5) -> str:
+async def smart_crawl_url(ctx: Context, url: str, max_depth: int = 3, max_concurrent: int = 10, chunk_size: int = 5000, return_raw_markdown: bool = False, query: Optional[List[str]] = None, max_rag_workers: int = 5) -> str:
     """
     Intelligently crawl a URL based on its type and store content in Supabase.
     Enhanced with raw markdown return and RAG query capabilities.
@@ -1172,9 +1198,15 @@ async def smart_crawl_url(ctx: Context, url: str, max_depth: int = 3, max_concur
             crawl_results = await crawl_batch(crawler, sitemap_urls, max_concurrent=max_concurrent)
             crawl_type = "sitemap"
         else:
-            # For regular URLs, use recursive crawl
-            crawl_results = await crawl_recursive_internal_links(crawler, [url], max_depth=max_depth, max_concurrent=max_concurrent)
-            crawl_type = "webpage"
+            web_crawler = ctx.request_context.lifespan_context.web_crawler
+            # For regular URLs, use adaptive crawl if query is provided, otherwise recursive
+            if query:
+                result = await crawler.digest(start_url=url, query=" ".join(query))
+                crawl_results = [{'url': r.url, 'markdown': r.markdown, 'links': r.links} for r in result.crawled_urls if r.success and r.markdown]
+                crawl_type = "adaptive_webpage"
+            else:
+                crawl_results = await crawl_recursive_internal_links(web_crawler, [url], max_depth=max_depth, max_concurrent=max_concurrent)
+                crawl_type = "webpage"
         
         if not crawl_results:
             return json.dumps({
@@ -1240,7 +1272,8 @@ async def smart_crawl_url(ctx: Context, url: str, max_depth: int = 3, max_concur
                 meta["url"] = source_url
                 meta["source"] = source_id
                 meta["crawl_type"] = crawl_type
-                meta["crawl_time"] = str(asyncio.current_task().get_coro().__name__)
+                task = asyncio.current_task()
+                meta["crawl_time"] = task.get_name() if task else "unknown"
                 metadatas.append(meta)
                 
                 # Accumulate word count
@@ -1468,7 +1501,7 @@ async def get_available_sources(ctx: Context) -> str:
         }, indent=2)
 
 @mcp.tool()
-async def perform_rag_query(ctx: Context, query: str, source: str = None, match_count: int = 5) -> str:
+async def perform_rag_query(ctx: Context, query: str, source: Optional[str] = None, match_count: int = 5) -> str:
     """
     Perform a RAG (Retrieval Augmented Generation) query on the stored content.
     
@@ -1739,7 +1772,7 @@ async def perform_rag_query(ctx: Context, query: str, source: str = None, match_
         }, indent=2)
 
 @mcp.tool()
-async def search_code_examples(ctx: Context, query: str, source_id: str = None, match_count: int = 5) -> str:
+async def search_code_examples(ctx: Context, query: str, source_id: Optional[str] = None, match_count: int = 5) -> str:
     """
     Search for code examples relevant to the query.
     
@@ -2228,7 +2261,7 @@ async def _handle_explore_command(session, command: str, repo_name: str) -> str:
     }, indent=2)
 
 
-async def _handle_classes_command(session, command: str, repo_name: str = None) -> str:
+async def _handle_classes_command(session, command: str, repo_name: Optional[str] = None) -> str:
     """Handle 'classes [repo]' command - list classes"""
     limit = 20
     
@@ -2347,7 +2380,7 @@ async def _handle_class_command(session, command: str, class_name: str) -> str:
     }, indent=2)
 
 
-async def _handle_method_command(session, command: str, method_name: str, class_name: str = None) -> str:
+async def _handle_method_command(session, command: str, method_name: str, class_name: Optional[str] = None) -> str:
     """Handle 'method <name> [class]' command - search for methods"""
     if class_name:
         query = """
