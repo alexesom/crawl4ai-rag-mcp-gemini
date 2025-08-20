@@ -71,24 +71,23 @@ _init_lock = asyncio.Lock()
 _singletons = SimpleNamespace(adaptive_crawler=None, reranker=None, web_crawler=None)
 _printed = set()
 
-def _print_once(msg):
-    if msg not in _printed:
-        print(msg, flush=True)
-        _printed.add(msg)
-
 async def get_singletons():
     async with _init_lock:
         if _singletons.adaptive_crawler is None:
-            bc = BrowserConfig(headless=True, verbose=False)
+            bc = BrowserConfig(
+                headless=True,
+                verbose=False,
+                user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36"
+            )
 
             web_crawler = AsyncWebCrawler(config=bc)
             await web_crawler.__aenter__()
 
             config = AdaptiveConfig(
-                strategy="embedding",
-                embedding_model="sentence-transformers/all-MiniLM-L6-v2",
-                n_query_variations=10,
-                embedding_min_confidence_threshold=0.3
+                confidence_threshold=0.80,
+                max_pages=30,
+                top_k_links=3,
+                min_gain_threshold=0.05 
             )
 
             adaptive_crawler = AdaptiveCrawler(web_crawler, config)
@@ -103,7 +102,7 @@ async def get_singletons():
                 device = "mps"
             else:
                 device = "cpu"
-            _print_once(f"Using device: {device}")
+            print(f"Using device: {device}", flush=True)
             _singletons.reranker = CrossEncoder("cross-encoder/ms-marco-MiniLM-L-6-v2", device=device)
     return _singletons
 
@@ -1181,6 +1180,8 @@ async def smart_crawl_url(ctx: Context, url: str, max_depth: int = 3, max_concur
         # Determine the crawl strategy
         crawl_results = []
         crawl_type = None
+
+        print(f"entegregfdfs!!!!!!!: {url}")
         
         if is_txt(url):
             # For text files, use simple crawl
@@ -1205,6 +1206,7 @@ async def smart_crawl_url(ctx: Context, url: str, max_depth: int = 3, max_concur
                 crawl_results = [{'url': r.url, 'markdown': r.markdown, 'links': r.links} for r in result.crawled_urls if r.success and r.markdown]
                 crawl_type = "adaptive_webpage"
             else:
+                # DEVNOTE: If no query, use recursive crawl for internal links
                 crawl_results = await crawl_recursive_internal_links(web_crawler, [url], max_depth=max_depth, max_concurrent=max_concurrent)
                 crawl_type = "webpage"
         
@@ -2618,10 +2620,12 @@ async def crawl_markdown_file(web_crawler: AsyncWebCrawler, url: str) -> List[Di
     crawl_config = CrawlerRunConfig(page_timeout=30000)
     try:
         result = await web_crawler.arun(url=url, config=crawl_config)
-        if result.success and result.markdown:
+        if hasattr(result, 'success') and result.success and hasattr(result, 'markdown') and result.markdown:
             return [{'url': url, 'markdown': result.markdown}]
         else:
-            print(f"Failed to crawl {url}: {result.error_message}")
+            import sys
+            error_msg = f"Crawl failed with message: {getattr(result, 'error_message', 'N/A')}"
+            print(f"WARNING: Failed to crawl {url}. Reason: {error_msg}. Full result: {result}", file=sys.stderr)
             return []
     except Exception as e:
         print(f"Error crawling markdown file {url}: {e}")
@@ -2639,7 +2643,14 @@ async def crawl_batch(web_crawler: AsyncWebCrawler, urls: List[str], max_concurr
     Returns:
         List of dictionaries with URL and markdown content
     """
-    crawl_config = CrawlerRunConfig(cache_mode=CacheMode.BYPASS, stream=False, page_timeout=30000)
+    crawl_config = CrawlerRunConfig(
+        cache_mode=CacheMode.BYPASS,
+        stream=False,
+        page_timeout=30000,
+        magic=True,
+        simulate_user=True,
+        override_navigator=True
+    )
     dispatcher = MemoryAdaptiveDispatcher(
         memory_threshold_percent=70.0,
         check_interval=1.0,
@@ -2647,7 +2658,21 @@ async def crawl_batch(web_crawler: AsyncWebCrawler, urls: List[str], max_concurr
     )
     try:
         results = await web_crawler.arun_many(urls=urls, config=crawl_config, dispatcher=dispatcher)
-        return [{'url': r.url, 'markdown': r.markdown, 'links': r.links} for r in results if r.success and r.markdown]
+        processed_results = []
+        for r in results:
+            if hasattr(r, 'success') and r.success and hasattr(r, 'markdown') and r.markdown:
+                processed_results.append({'url': r.url, 'markdown': r.markdown, 'links': r.links})
+            else:
+                import sys
+                error_msg = "Unknown reason"
+                if not hasattr(r, 'success'):
+                    error_msg = "Result object has no 'success' attribute."
+                elif not r.success:
+                    error_msg = f"Crawl failed with message: {getattr(r, 'error_message', 'N/A')}"
+                elif not hasattr(r, 'markdown') or not r.markdown:
+                    error_msg = "Crawl succeeded but no markdown content was extracted."
+                print(f"WARNING: Skipping batch crawl result for {getattr(r, 'url', 'Unknown URL')}. Reason: {error_msg}. Full result: {r}", file=sys.stderr)
+        return processed_results
     except Exception as e:
         print(f"Error during batch crawl: {e}")
         return []
@@ -2665,7 +2690,14 @@ async def crawl_recursive_internal_links(web_crawler: AsyncWebCrawler, start_url
     Returns:
         List of dictionaries with URL and markdown content
     """
-    run_config = CrawlerRunConfig(cache_mode=CacheMode.BYPASS, stream=False, page_timeout=30000)
+    run_config = CrawlerRunConfig(
+        cache_mode=CacheMode.BYPASS,
+        stream=False,
+        page_timeout=30000,
+        magic=True,
+        simulate_user=True,
+        override_navigator=True,
+    )
     dispatcher = MemoryAdaptiveDispatcher(
         memory_threshold_percent=70.0,
         check_interval=1.0,
@@ -2686,22 +2718,33 @@ async def crawl_recursive_internal_links(web_crawler: AsyncWebCrawler, start_url
             break
 
         try:
-            results = await web_crawler.arun_many(urls=urls_to_crawl, config=run_config, dispatcher=dispatcher)
+            results = await web_crawler.arun_many(
+                urls=urls_to_crawl,
+                config=run_config,
+                dispatcher=dispatcher
+            )
         except Exception as e:
             print(f"Error during recursive crawl at depth {depth}: {e}")
             results = []
         next_level_urls = set()
 
         for result in results:
+            if not (hasattr(result, 'success') and hasattr(result, 'url')):
+                import sys
+                print(f"WARNING: Skipping malformed recursive crawl result: {result}", file=sys.stderr)
+                continue
+
             norm_url = normalize_url(result.url)
             visited.add(norm_url)
 
-            if result.success and result.markdown:
+            if result.success and hasattr(result, 'markdown') and result.markdown:
                 results_all.append({'url': result.url, 'markdown': result.markdown})
-                for link in result.links.get("internal", []):
-                    next_url = normalize_url(link["href"])
-                    if next_url not in visited:
-                        next_level_urls.add(next_url)
+                if hasattr(result, 'links') and result.links:
+                    for link in result.links.get("internal", []):
+                        if "href" in link:
+                            next_url = normalize_url(link["href"])
+                            if next_url not in visited:
+                                next_level_urls.add(next_url)
 
         current_urls = next_level_urls
 
