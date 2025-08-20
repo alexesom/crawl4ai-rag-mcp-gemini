@@ -1,7 +1,7 @@
 # Caddyfile for SearXNG reverse proxy
 # This configuration provides HTTPS termination and proxies requests to SearXNG
 
-{$SEARXNG_BASE_URL:localhost} {
+{$SEARXNG_HOSTNAME:localhost} {
     @api {
         path /search
         query format=json*
