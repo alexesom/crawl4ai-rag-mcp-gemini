@@ -2,7 +2,7 @@
 
 <em>Web Crawling, Search and RAG Capabilities for AI Agents and AI Coding Assistants</em>
 
-> **(FORKED FROM https://github.com/coleam00/mcp-crawl4ai-rag). Added SearXNG integration and batch scrape and processing capabilities.**
+> **(FORKED FROM https://github.com/coleam00/mcp-crawl4ai-rag). Added SearXNG integration and batch scrape and processing capabilities. Also switched to Gemini client wich enchanced crawling**
 
 A **self-contained Docker solution** that combines the [Model Context Protocol (MCP)](https://modelcontextprotocol.io), [Crawl4AI](https://crawl4ai.com), [SearXNG](https://github.com/searxng/searxng), and [Supabase](https://supabase.com/) to provide AI agents and coding assistants with complete web **search, crawling, and RAG capabilities**.
 
@@ -83,7 +83,7 @@ The server provides essential web crawling and search tools:
 **Required:**
 - [Docker and Docker Compose](https://www.docker.com/products/docker-desktop/) - This is a Docker-only solution
 - [Supabase account](https://supabase.com/) - For vector database and RAG functionality
-- [OpenAI API key](https://platform.openai.com/api-keys) - For generating embeddings
+- [Gemini API key](https://ai.google.dev/gemini-api/docs/api-key) - For generating embeddings
 
 **Optional:**
 - [Neo4j instance](https://neo4j.com/) - For knowledge graph functionality (see [Knowledge Graph Setup](#knowledge-graph-setup))
@@ -107,10 +107,37 @@ This is a **Docker-only solution** - no Python environment setup required!
    # Edit .env with your API keys (see Configuration section below)
    ```
 
+#### Using SSE transport:
+
 3. **Deploy the complete stack:**
    ```bash
    docker compose up -d
    ```
+
+4. **Edit your MCP config:**
+   ```json
+    "crawl4ai-rag": {
+      "command": "npx",
+      "args": ["mcp-remote", "http://localhost:8051/sse"]
+    }
+   ```
+
+#### Using STDIO transport:
+
+3. **Create virtual environment:**
+    ```bash
+   docker compose up -d
+   ```
+
+4. **Edit your MCP config:**
+   ```json
+    "crawl4ai-rag": {
+      "command": "/absolute/path/to/your/virtualenv/.venv/bin/python",
+      "args": ["/absolute/path/to/repo/crawl4ai-rag-mcp-gemini/src/crawl4ai_mcp.py"],
+      "envFile": "absolute/path/to/envfile/.env"
+    }
+   ```
+
 
 That's it! Your complete search, crawl, and RAG stack is now running:
 - **MCP Server**: http://localhost:8051
@@ -212,11 +239,11 @@ SEARXNG_HOSTNAME=http://localhost
 # ========================================
 # AI SERVICES CONFIGURATION
 # ========================================
-# Required: OpenAI API for embeddings
-OPENAI_API_KEY=your_openai_api_key
+# Required: Gemini API for embeddings
+GEMINI_API_KEY=your_gemini_api_key
 
 # LLM for summaries and contextual embeddings
-MODEL_CHOICE=gpt-4.1-nano-2025-04-14
+MODEL_CHOICE=gemini-2.5-flash-lite
 
 # Required: Supabase for vector database
 SUPABASE_URL=your_supabase_project_url
@@ -565,4 +592,3 @@ This Docker stack provides a foundation for building more complex MCP servers:
 2. **Add custom tools**: Extend `src/crawl4ai_mcp.py` with `@mcp.tool()` decorators
 3. **Customize SearXNG**: Edit `searxng/settings.yml` and restart
 4. **Add services**: Extend `docker-compose.yml` with additional containers
-

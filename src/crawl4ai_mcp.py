@@ -103,7 +103,11 @@ async def get_singletons():
             else:
                 device = "cpu"
             print(f"Using device: {device}", flush=True)
+            start_time = time.time()
+            print("Initializing CrossEncoder model...", flush=True)
             _singletons.reranker = CrossEncoder("cross-encoder/ms-marco-MiniLM-L-6-v2", device=device)
+            end_time = time.time()
+            print(f"CrossEncoder model initialized in {end_time - start_time:.2f} seconds.", flush=True)
     return _singletons
 
 
@@ -186,6 +190,7 @@ async def crawl4ai_lifespan(server: FastMCP) -> AsyncIterator[Crawl4AIContext]:
     Yields:
         Crawl4AIContext: The context containing the Crawl4AI crawler and Supabase client
     """
+    print("Initializing lifespan...", flush=True)
     # Initialize Supabase client
     supabase_client = get_supabase_client()
 
@@ -203,6 +208,7 @@ async def crawl4ai_lifespan(server: FastMCP) -> AsyncIterator[Crawl4AIContext]:
     
     # Check if knowledge graph functionality is enabled
     knowledge_graph_enabled = os.getenv("USE_KNOWLEDGE_GRAPH", "false") == "true"
+    print(f"Knowledge graph enabled: {knowledge_graph_enabled}", flush=True)
     
     if knowledge_graph_enabled:
         neo4j_uri = os.getenv("NEO4J_URI")
@@ -231,8 +237,10 @@ async def crawl4ai_lifespan(server: FastMCP) -> AsyncIterator[Crawl4AIContext]:
             print("Neo4j credentials not configured - knowledge graph tools will be unavailable")
     else:
         print("Knowledge graph functionality disabled - set USE_KNOWLEDGE_GRAPH=true to enable")
+    print("Neo4j components initialized (or skipped).", flush=True)
     
     try:
+        print("Yielding context...", flush=True)
         yield Crawl4AIContext(
             adaptive_crawler=adaptive_crawler,
             web_crawler=web_crawler,
@@ -242,6 +250,7 @@ async def crawl4ai_lifespan(server: FastMCP) -> AsyncIterator[Crawl4AIContext]:
             repo_extractor=repo_extractor
         )
     finally:
+        print("Cleaning up lifespan...", flush=True)
         # Clean up all components
         if _singletons.web_crawler:
             await _singletons.web_crawler.__aexit__(None, None, None)

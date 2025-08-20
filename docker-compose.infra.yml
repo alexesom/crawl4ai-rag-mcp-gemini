@@ -1,33 +1,4 @@
 services:
-  # MCP Crawl4AI Server
-  mcp-crawl4ai:
-    build:
-      context: .
-      dockerfile: Dockerfile
-    container_name: mcp-crawl4ai
-    restart: unless-stopped
-    environment:
-      - TRANSPORT=${TRANSPORT:-sse}
-      - HOST=${HOST:-0.0.0.0}
-      - PORT=${PORT:-8051}
-      - SEARXNG_URL=${SEARXNG_URL:-http://searxng:8080}
-    env_file:
-      - .env
-    ports:
-      - "8051:8051"
-    depends_on:
-      - searxng
-    networks:
-      - searxng
-    volumes:
-      - ./data:/app/data
-      - ./logs:/app/logs
-    logging:
-      driver: "json-file"
-      options:
-        max-size: "1m"
-        max-file: "1"
-
   # Reverse Proxy (Caddy)
   caddy:
     container_name: caddy
